@@ -1,0 +1,10 @@
+*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/CATALOG.md
+!/catalog.json
+!/CONTENT_POLICY.md
+!/.github/
+!/.github/workflows/
+!/.github/workflows/ci.yml

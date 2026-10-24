@@ -1,0 +1,187 @@
+name: Public catalog policy
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Verify document-only public tree and history
+        shell: python
+        run: |
+          import sys
+          sys.argv = ['public-policy', '--root', '.', '--public', '--revision', 'HEAD', '--history']
+          """Offline Git-index/commit policy check. Reports paths and rule names, never values."""
+          import argparse
+          import json
+          import math
+          from pathlib import Path, PurePosixPath
+          import re
+          import subprocess
+          import sys
+
+          ROOT_FILES = {'.gitignore', '.gitattributes', '.editorconfig', '.python-version', 'README.md', 'AGENTS.md', 'LICENSE', 'LICENSE.md', 'pyproject.toml'}
+          ROOT_DIRS = {'skills', 'scripts', 'tests', 'config', 'docs', 'library', '.github'}
+          PUBLIC_PATHS = {'README.md', 'CATALOG.md', 'catalog.json', 'CONTENT_POLICY.md', '.gitignore', '.gitattributes', '.github/workflows/ci.yml'}
+          PUBLIC_FIELDS = {'id', 'title', 'channel', 'source_url', 'duration_seconds', 'upload_date', 'language', 'rights_status', 'processing_status', 'text_published'}
+          TEXT_EXTENSIONS = {'.py', '.md', '.txt', '.json', '.srt', '.vtt', '.html', '.yml', '.yaml', '.toml', '.ps1', '.ini', '.cfg', '.csv', '.tsv'}
+          SECRET_RULES = {
+              'github-token': re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b'),
+              'service-api-key': re.compile(r'\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}\b'),
+              'aws-access-id': re.compile(r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b'),
+              'private-key': re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'),
+              'signed-download-url': re.compile(r'[?&](?:signature|sig|lsig|expire|x-amz-signature|x-goog-signature)=[^\s\"\'<>]+', re.I),
+              'embedded-auth': re.compile(r'https?://[^\s/:]+:[^\s/@]+@', re.I),
+              'authorization-header': re.compile(r'\b(?:Bearer|token)\s+[A-Za-z0-9_.-]{30,}', re.I),
+          }
+          DOWNLOAD_FIELDS = {'formats', 'requested_formats', 'automatic_captions', 'http_headers', 'cookies', 'cookiefile', 'thumbnails', 'requested_downloads'}
+          SECRET_FIELDS = {'api_key', 'apikey', 'access_token', 'refresh_token', 'client_secret', 'password', 'authorization', 'cookie'}
+          PLACEHOLDER = re.compile(r'^(?:<.*>|YOUR_.*|CHANGE.*|example|redacted|\*+)$', re.I)
+          ASSIGNMENT = re.compile(r'''(?im)^\s*["']?(?:api_key|apikey|access_token|refresh_token|client_secret|password|authorization|cookie)["']?\s*[:=]\s*["']?([^\r\n"'#]+)''')
+
+
+          def valid_public_item(item):
+              if not isinstance(item, dict) or set(item) != PUBLIC_FIELDS or item['text_published'] is not False:
+                  return False
+              video_id = item['id']
+              if not isinstance(video_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id) or item['source_url'] != 'https://www.youtube.com/watch?v=' + video_id:
+                  return False
+              if item['rights_status'] != 'unknown' or item['processing_status'] not in {'text_backed_up', 'editorial_pending', None}:
+                  return False
+              for key in ('title', 'channel', 'upload_date', 'language'):
+                  if item[key] is not None and (not isinstance(item[key], str) or len(item[key]) > 1000):
+                      return False
+              duration = item['duration_seconds']
+              return duration is None or (not isinstance(duration, bool) and isinstance(duration, (float, int)) and math.isfinite(duration) and duration >= 0)
+
+
+          def json_issues(value):
+              issues = set()
+              if isinstance(value, dict):
+                  for key, item in value.items():
+                      lowered = str(key).lower()
+                      if lowered in DOWNLOAD_FIELDS:
+                          issues.add('raw-downloader-metadata')
+                      if lowered in SECRET_FIELDS and item and not (isinstance(item, str) and PLACEHOLDER.fullmatch(item)):
+                          issues.add('credential-field')
+                      issues.update(json_issues(item))
+              elif isinstance(value, list):
+                  for item in value:
+                      issues.update(json_issues(item))
+              return issues
+
+
+          def validate_blob(path, data, public=False):
+              """Return rule names for a single blob; never return matched contents."""
+              issues = set()
+              part = PurePosixPath(path)
+              if part.is_absolute() or '..' in part.parts or '\\' in path:
+                  issues.add('unsafe-path')
+              if public:
+                  if path not in PUBLIC_PATHS:
+                      issues.add('public-path-not-allowed')
+              elif not ((len(part.parts) == 1 and (path in ROOT_FILES or re.fullmatch(r'requirements[\w.-]*\.txt', path))) or (part.parts and part.parts[0] in ROOT_DIRS)):
+                  issues.add('private-path-not-allowed')
+              name = part.name.lower()
+              if name.startswith('.env') or name.startswith('config.local.') or 'cookies' in name or 'credentials' in name or name.endswith(('.pem', '.key', '.info.json', '.partial.jsonl')) or name in {'workflow.lock', 'processing.lock', 'progress.json'}:
+                  issues.add('local-only-file')
+              if part.suffix.lower() not in TEXT_EXTENSIONS and name not in {x.lower() for x in ROOT_FILES}:
+                  issues.add('non-text-extension')
+              if len(data) > 10 * 1024 * 1024:
+                  issues.add('file-over-10-mib')
+              if b'\x00' in data:
+                  issues.add('binary-content')
+              try:
+                  content = data.decode('utf-8-sig')
+              except UnicodeDecodeError:
+                  return sorted(issues | {'not-utf8-text'})
+              if any(ord(c) < 32 and c not in '\t\r\n\f' for c in content):
+                  issues.add('binary-control-character')
+              for name, regex in SECRET_RULES.items():
+                  if regex.search(content):
+                      issues.add(name)
+              for matched in ASSIGNMENT.finditer(content):
+                  candidate = matched.group(1).strip().rstrip(',')
+                  if candidate and candidate not in {'None', 'null', 'False', '$null', '{}', '[]'} and not PLACEHOLDER.fullmatch(candidate):
+                      issues.add('credential-assignment')
+              if public and re.search(r'(?i)(?:\b[A-Z]:[\\/]|/[U]sers/|/[h]ome/|/[m]nt/)', content):
+                  issues.add('private-local-path')
+              if part.suffix.lower() == '.json':
+                  try:
+                      value = json.loads(content)
+                      issues.update(json_issues(value))
+                      if public and path == 'catalog.json':
+                          if not isinstance(value, dict) or set(value) != {'schema_version', 'items'} or value['schema_version'] != 1 or not isinstance(value['items'], list):
+                              issues.add('invalid-public-catalog')
+                          else:
+                              for item in value['items']:
+                                  if not valid_public_item(item):
+                                      issues.add('invalid-public-item')
+                  except (ValueError, TypeError):
+                      issues.add('invalid-json')
+              return sorted(issues)
+
+
+          def git(root, *args):
+              result = subprocess.run(['git', '-C', str(root), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if result.returncode:
+                  raise ValueError('Git read failed: ' + result.stderr.decode('utf-8', errors='replace').strip())
+              return result.stdout
+
+
+          def scan_repository(root, revision=None, public=False):
+              root = Path(root)
+              listing = git(root, 'ls-tree', '-r', '-z', revision) if revision else git(root, 'ls-files', '--stage', '-z')
+              issues, count = [], 0
+              for entry in listing.split(b'\0'):
+                  if not entry:
+                      continue
+                  header, path_bytes = entry.split(b'\t', 1)
+                  path = path_bytes.decode('utf-8')
+                  fields = header.decode('ascii').split()
+                  mode, oid = fields[0], fields[2] if revision else fields[1]
+                  count += 1
+                  if mode not in {'100644', '100755'}:
+                      issues.append((path, 'symlink-submodule-or-unmerged-entry'))
+                      continue
+                  data = git(root, 'cat-file', 'blob', oid)
+                  issues.extend((path, rule) for rule in validate_blob(path, data, public))
+              if count == 0:
+                  issues.append(('.', 'empty-git-tree'))
+              return issues, count
+
+
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
+              parser.add_argument('--revision', help='Scan this committed tree; default is the real Git index.')
+              parser.add_argument('--public', action='store_true')
+              parser.add_argument('--history', action='store_true', help='Scan every reachable commit as well as the requested tree.')
+              args = parser.parse_args()
+              try:
+                  issues, count = scan_repository(args.root, args.revision, args.public)
+                  revisions = git(args.root, 'rev-list', '--all').decode().splitlines() if args.history else []
+                  for revision in revisions:
+                      old_issues, _ = scan_repository(args.root, revision, args.public)
+                      issues.extend(old_issues)
+                  for path, rule in sorted(set(issues)):
+                      print(f'REJECT {path}: {rule}')
+                  print(f'Checked {count} text candidates; {len(set(issues))} policy violations; {len(revisions)} historical commits checked.')
+                  return 1 if issues else 0
+              except (ValueError, OSError) as exc:
+                  print(str(exc), file=sys.stderr)
+                  return 2
+
+
+          if __name__ == '__main__':
+              raise SystemExit(main())
