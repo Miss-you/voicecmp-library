@@ -32,6 +32,7 @@ jobs:
 
           ROOT_FILES = {'.gitignore', '.gitattributes', '.editorconfig', '.python-version', 'README.md', 'AGENTS.md', 'LICENSE', 'LICENSE.md', 'pyproject.toml'}
           ROOT_DIRS = {'skills', 'scripts', 'tests', 'config', 'docs', 'library', '.github'}
+          PROJECT_SKILL_FILES = {'.agents/skills/transcribe-youtube-video/SKILL.md'}
           PUBLIC_PATHS = {'README.md', 'CATALOG.md', 'catalog.json', 'CONTENT_POLICY.md', '.gitignore', '.gitattributes', '.github/workflows/ci.yml'}
           PUBLIC_FIELDS = {'id', 'title', 'channel', 'source_url', 'duration_seconds', 'upload_date', 'language', 'rights_status', 'processing_status', 'text_published'}
           TEXT_EXTENSIONS = {'.py', '.md', '.txt', '.json', '.srt', '.vtt', '.html', '.yml', '.yaml', '.toml', '.ps1', '.ini', '.cfg', '.csv', '.tsv'}
@@ -90,7 +91,7 @@ jobs:
               if public:
                   if path not in PUBLIC_PATHS:
                       issues.add('public-path-not-allowed')
-              elif not ((len(part.parts) == 1 and (path in ROOT_FILES or re.fullmatch(r'requirements[\w.-]*\.txt', path))) or (part.parts and part.parts[0] in ROOT_DIRS)):
+              elif not (path in PROJECT_SKILL_FILES or (len(part.parts) == 1 and (path in ROOT_FILES or re.fullmatch(r'requirements[\w.-]*\.txt', path))) or (part.parts and part.parts[0] in ROOT_DIRS)):
                   issues.add('private-path-not-allowed')
               name = part.name.lower()
               if name.startswith('.env') or name.startswith('config.local.') or 'cookies' in name or 'credentials' in name or name.endswith(('.pem', '.key', '.info.json', '.partial.jsonl')) or name in {'workflow.lock', 'processing.lock', 'progress.json'}:
